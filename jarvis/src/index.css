@@ -1,0 +1,5 @@
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; width: 100%; min-height: 100%; }
+html { background: #000; }
+body { background: #000; }
+button, textarea, select { font: inherit; }
