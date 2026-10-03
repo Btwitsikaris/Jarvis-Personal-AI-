@@ -8,7 +8,7 @@ function cleanKey(value) {
 
 function getApiKey() {
   // The key is always read server-side. This also accepts a legacy variable name
-  // so older working Jarvis .env files continue to work.
+  // so older working Jarvis .env files continue to work and no problem occur further .
   return cleanKey(process.env.GROQ_API_KEY || process.env.GROQ_KEY);
 }
 const MODES = { general:"Act as a versatile personal AI assistant.", college:"Act as a college/project mentor. Help with research, project planning, reports, presentations, explanations and viva preparation. Teach clearly.", code:"Act as a senior coding assistant. Diagnose bugs, explain root causes, propose maintainable solutions and provide complete code when useful." };
