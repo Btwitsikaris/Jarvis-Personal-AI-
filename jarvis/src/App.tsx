@@ -1,6 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Code2,
@@ -22,14 +22,22 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
-import JarvisThreeScene from "./components/JarvisThreeScene";
-import LandingBackground from "./components/LandingBackground";
 import "./App.css";
+
+// Three.js is large, so load it on demand instead of in the main bundle.
+const JarvisSceneLazy = lazy(() => import("./components/JarvisThreeScene"));
+const LandingBackgroundLazy = lazy(() => import("./components/LandingBackground"));
+const JarvisThreeScene = (props: ComponentProps<typeof JarvisSceneLazy>) => (
+  <Suspense fallback={null}><JarvisSceneLazy {...props} /></Suspense>
+);
+const LandingBackground = () => (
+  <Suspense fallback={null}><LandingBackgroundLazy /></Suspense>
+);
 
 type Role = "user" | "assistant";
 type Mode = "general" | "college" | "code";
 type Source = { title: string; url: string; content: string };
-type Message = { id: string; role: Role; content: string; fileName?: string };
+type Message = { id: string; role: Role; content: string; fileName?: string; error?: boolean };
 type ChatSession = { id: string; title: string; messages: Message[]; updatedAt: number };
 
 const Jarvis_INTRO =
@@ -44,6 +52,95 @@ const id = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 function makeSession(): ChatSession {
   return { id: id(), title: "New chat", messages: [], updatedAt: Date.now() };
+}
+
+const MAX_SESSIONS = 60;
+const MAX_DOC_CHARS = 50000;
+const MAX_PDF_BYTES = 15 * 1024 * 1024;
+const WEB_HINT = /\b(latest|today|tonight|yesterday|tomorrow|current(ly)?|recent(ly)?|news|price|prices|weather|score|scores|stock|stocks|search|look up|google|who is|who won|what happened|this (week|month|year)|release date|trending|202[5-9]|203\d)\b/i;
+
+const safeGet = (key: string) => {
+  try { return localStorage.getItem(key); } catch { return null; }
+};
+const safeSet = (key: string, value: string) => {
+  try { localStorage.setItem(key, value); return true; } catch { return false; }
+};
+
+function loadSessions(): ChatSession[] {
+  try {
+    const raw = JSON.parse(safeGet("jarvis-chats") || "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((s: any) => s && typeof s.id === "string" && Array.isArray(s.messages))
+      .map((s: any): ChatSession => ({
+        id: s.id,
+        title: typeof s.title === "string" ? s.title : "New chat",
+        updatedAt: typeof s.updatedAt === "number" ? s.updatedAt : Date.now(),
+        messages: s.messages
+          .filter((m: any) => m && typeof m.content === "string" && (m.role === "user" || m.role === "assistant"))
+          .map((m: any): Message => ({
+            id: typeof m.id === "string" ? m.id : id(),
+            role: m.role,
+            content: m.content,
+            fileName: typeof m.fileName === "string" ? m.fileName : undefined,
+            error: m.error === true,
+          })),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function safeHost(url: string): string {
+  try {
+    const u = new URL(url);
+    return /^https?:$/.test(u.protocol) ? u.hostname : "";
+  } catch {
+    return "";
+  }
+}
+
+function cleanSources(input: unknown): Source[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter((s: any) => s && typeof s.url === "string" && safeHost(s.url))
+    .map((s: any) => ({ title: String(s.title || s.url).slice(0, 200), url: s.url, content: String(s.content || "") }));
+}
+
+class ApiError extends Error {
+  code?: string;
+}
+
+// POST helper: handles non-JSON replies, network errors and the optional access-code gate.
+async function api(path: string, body: unknown, canPrompt = true): Promise<any> {
+  const code = safeGet("jarvis-access-code") || "";
+  let r: Response;
+  try {
+    r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(code ? { "x-access-code": code } : {}) },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new ApiError("Network error. Check your connection and try again.");
+  }
+  let data: any = null;
+  try { data = await r.json(); } catch {}
+  if (r.status === 401 && data?.code === "ACCESS_REQUIRED") {
+    if (canPrompt) {
+      const entered = window.prompt(code ? "That access code was not accepted. Enter the access code:" : "Enter the access code to use Jarvis:");
+      if (entered && entered.trim()) {
+        safeSet("jarvis-access-code", entered.trim());
+        return api(path, body, false);
+      }
+    }
+    const err = new ApiError("A valid access code is required.");
+    err.code = "ACCESS_REQUIRED";
+    throw err;
+  }
+  if (!r.ok) throw new ApiError(typeof data?.error === "string" ? data.error : `Request failed (${r.status}).`);
+  if (!data) throw new ApiError("The server returned an unexpected response.");
+  return data;
 }
 
 
@@ -100,7 +197,7 @@ function LandingPage({ onStart }: { onStart: () => void }) {
           <div className="footer-contact">
             <p className="footer-label">CONTACT</p>
             <p>Designed by <strong>Aniket Majumdar</strong></p>
-            <a href="mailto:aniketmajundar2006@gmail.com">aniketmajundar2006@gmail.com</a>
+            <a href="mailto:aniketmajumdar2006@gmail.com">aniketmajumdar2006@gmail.com</a>
             <p>for questions, bugs, or feedback</p>
           </div>
         </div>
@@ -134,14 +231,8 @@ function ListeningIndicator({ speaking }: { speaking: boolean }) {
 }
 
 function ChatApp() {
-  const [sessions, setSessions] = useState<ChatSession[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem("jarvis-chats") || "[]");
-    } catch {
-      return [];
-    }
-  });
-  const [activeId, setActiveId] = useState<string>(() => localStorage.getItem("jarvis-active-chat") || "");
+  const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
+  const [activeId, setActiveId] = useState<string>(() => safeGet("jarvis-active-chat") || "");
   const [input, setInput] = useState("");
   const [web, setWeb] = useState(true);
   const [sources, setSources] = useState<Source[]>([]);
@@ -156,6 +247,7 @@ function ChatApp() {
   const [fileContext, setFileContext] = useState("");
   const [fileLoading, setFileLoading] = useState(false);
   const [showTools, setShowTools] = useState(false);
+  const [fileAnnounced, setFileAnnounced] = useState(false);
 
   const openLanding = () => {
     history.pushState(null, "", window.location.pathname + window.location.search);
@@ -170,6 +262,11 @@ function ChatApp() {
   const speechResetTimer = useRef<number | null>(null);
   const voices = useRef<SpeechSynthesisVoice[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const inputRef = useRef("");
+  const baseSpeech = useRef("");
+  const finalSpeech = useRef("");
+  const rapidRestarts = useRef(0);
+  inputRef.current = input;
 
   const activeSession = sessions.find((s) => s.id === activeId);
   const messages = activeSession?.messages || [];
@@ -180,8 +277,10 @@ function ChatApp() {
   }, [sessions, activeId]);
 
   useEffect(() => {
-    localStorage.setItem("jarvis-chats", JSON.stringify(sessions));
-    if (activeId) localStorage.setItem("jarvis-active-chat", activeId);
+    const trimmed = sessions.slice(0, MAX_SESSIONS);
+    // If storage is full, fall back to saving only the most recent chats instead of throwing.
+    if (!safeSet("jarvis-chats", JSON.stringify(trimmed))) safeSet("jarvis-chats", JSON.stringify(trimmed.slice(0, 15)));
+    if (activeId) safeSet("jarvis-active-chat", activeId);
   }, [sessions, activeId]);
 
   useEffect(() => {
@@ -288,21 +387,27 @@ function ChatApp() {
     window.speechSynthesis?.cancel();
   };
 
+  const notify = (content: string) => {
+    const session = ensureSession();
+    updateSession(session.id, [...session.messages, { id: id(), role: "assistant", content, error: true }], session.title, session);
+  };
+
+  const stopMic = () => {
+    listeningRef.current = false;
+    setListening(false);
+    setVoiceSpeaking(false);
+    if (speechResetTimer.current) window.clearTimeout(speechResetTimer.current);
+    try { recognition.current?.stop(); } catch {}
+  };
+
   const toggleMic = () => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) {
-      const session = ensureSession();
-      const current = session.messages;
-      updateSession(session.id, [...current, { id: id(), role: "assistant", content: "Voice input is not supported here. Please use Chrome or Edge and allow microphone access." }], session.title, session);
+      notify("Voice input is not supported here. Please use Chrome or Edge and allow microphone access.");
       return;
     }
-
     if (listeningRef.current) {
-      listeningRef.current = false;
-      setListening(false);
-      setVoiceSpeaking(false);
-      if (speechResetTimer.current) window.clearTimeout(speechResetTimer.current);
-      recognition.current?.stop();
+      stopMic();
       return;
     }
 
@@ -311,45 +416,58 @@ function ChatApp() {
     r.interimResults = true;
     r.continuous = true;
     r.maxAlternatives = 1;
+    baseSpeech.current = inputRef.current.trimEnd();
+    finalSpeech.current = "";
+    rapidRestarts.current = 0;
 
     r.onresult = (e: any) => {
-      let t = "";
+      let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        t += e.results[i][0].transcript;
+        const res = e.results[i];
+        if (res.isFinal) finalSpeech.current += res[0].transcript;
+        else interim += res[0].transcript;
       }
-      setInput((prev) => {
-        // SpeechRecognition may send a full transcript repeatedly. Replace the live
-        // transcript while listening rather than appending duplicate phrases.
-        return t || prev;
-      });
+      // Keep everything already spoken (and typed) and add the live transcript on top.
+      const spoken = (finalSpeech.current + interim).trim();
+      setInput([baseSpeech.current, spoken].filter(Boolean).join(" "));
+      rapidRestarts.current = 0;
       setVoiceSpeaking(true);
       if (speechResetTimer.current) window.clearTimeout(speechResetTimer.current);
       speechResetTimer.current = window.setTimeout(() => setVoiceSpeaking(false), 700);
     };
 
     r.onend = () => {
-      if (listeningRef.current) {
-        // Chrome can end recognition after a short silence even with continuous mode.
-        // Restart it so the visual remains active until the user taps the mic again.
-        try { r.start(); } catch {}
-      } else {
-        setListening(false);
-        setVoiceSpeaking(false);
-      }
-    };
-
-    r.onerror = (event: any) => {
-      if (event?.error === "not-allowed" || event?.error === "service-not-allowed") {
-        listeningRef.current = false;
+      if (!listeningRef.current) {
         setListening(false);
         setVoiceSpeaking(false);
         return;
       }
-      // Ignore recoverable no-speech/aborted events while the user still has the mic on.
-      if (!listeningRef.current) {
-        setListening(false);
-        setVoiceSpeaking(false);
+      // Chrome ends recognition after silence. Restart, but give up if it keeps ending without results.
+      rapidRestarts.current += 1;
+      if (rapidRestarts.current > 5) {
+        stopMic();
+        notify("Voice input stopped after a period of silence. Tap the microphone to start again.");
+        return;
       }
+      baseSpeech.current = inputRef.current.trimEnd();
+      finalSpeech.current = "";
+      window.setTimeout(() => {
+        if (listeningRef.current) {
+          try { r.start(); } catch {}
+        }
+      }, 250);
+    };
+
+    r.onerror = (event: any) => {
+      const err = event?.error;
+      if (err === "no-speech" || err === "aborted") return;
+      stopMic();
+      notify(
+        err === "not-allowed" || err === "service-not-allowed" ? "Microphone access was blocked. Allow it in your browser's site settings and try again."
+        : err === "audio-capture" ? "No microphone was found."
+        : err === "network" ? "Voice recognition needs an internet connection."
+        : "Voice input stopped unexpectedly.",
+      );
     };
 
     recognition.current = r;
@@ -359,31 +477,46 @@ function ChatApp() {
     try {
       r.start();
     } catch {
-      listeningRef.current = false;
-      setListening(false);
+      stopMic();
     }
   };
 
+  const setDocument = (name: string, text: string, prompt: string) => {
+    setFileContext(text.slice(0, MAX_DOC_CHARS));
+    setFileName(name);
+    setFileAnnounced(false);
+    setInput((prev) => (prev.trim() ? prev : prompt));
+  };
+
   const loadPdf = async (file: File) => {
+    if (file.size > MAX_PDF_BYTES) {
+      notify("That PDF is larger than 15 MB. Please attach a smaller file.");
+      return;
+    }
     setFileLoading(true);
     try {
-      const load = new Function("u", "return import(u)");
-      const pdfjs: any = await load("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.mjs");
-      pdfjs.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.mjs";
-      const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+      // Bundled locally (no third-party CDN). The legacy build supports older browsers.
+      const [pdfjs, worker] = await Promise.all([
+        import("pdfjs-dist/legacy/build/pdf.mjs"),
+        import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url"),
+      ]);
+      pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
+      const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;
       let text = "";
       for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
         const c = await page.getTextContent();
-        text += `\n--- Page ${i} ---\n` + c.items.map((x: any) => x.str).join(" ");
-        if (text.length > 50000) break;
+        text += `\n--- Page ${i} ---\n` + c.items.map((x: any) => x.str ?? "").join(" ");
+        if (text.length > MAX_DOC_CHARS) break;
       }
-      setFileContext(text.slice(0, 50000));
-      setFileName(file.name);
-      setInput(`Analyze the attached document (${file.name}) and summarize the key points.`);
+      await pdf.destroy();
+      if (text.replace(/--- Page \d+ ---/g, "").trim().length < 20) {
+        notify("I couldn't find any selectable text in that PDF. It may be a scan or an image-only PDF.");
+        return;
+      }
+      setDocument(file.name, text, `Analyze the attached document (${file.name}) and summarize the key points.`);
     } catch {
-      const session = ensureSession();
-      updateSession(session.id, [...session.messages, { id: id(), role: "assistant", content: "I couldn't read that PDF. Try a text-based PDF or TXT/MD/CSV/JSON file." }], session.title, session);
+      notify("I couldn't read that PDF. Try a text-based PDF or TXT/MD/CSV/JSON file.");
     } finally {
       setFileLoading(false);
     }
@@ -397,76 +530,71 @@ function ChatApp() {
     }
     if (file.type.startsWith("text/") || /\.(txt|md|csv|json)$/i.test(file.name)) {
       setFileLoading(true);
-      setFileContext((await file.text()).slice(0, 50000));
-      setFileName(file.name);
-      setInput(`Analyze the attached file (${file.name}).`);
-      setFileLoading(false);
+      try {
+        // Read only the first few hundred KB so huge files can't freeze the tab.
+        const text = (await file.slice(0, MAX_DOC_CHARS * 4).text()).replace(/\u0000/g, "");
+        if (!text.trim()) {
+          notify("That file looks empty.");
+          return;
+        }
+        setDocument(file.name, text, `Analyze the attached file (${file.name}).`);
+      } catch {
+        notify("I couldn't read that file.");
+      } finally {
+        setFileLoading(false);
+      }
       return;
     }
-    const session = ensureSession();
-    updateSession(session.id, [...session.messages, { id: id(), role: "assistant", content: "Jarvis currently supports PDF, TXT, MD, CSV and JSON attachments." }], session.title, session);
+    notify("Jarvis currently supports PDF, TXT, MD, CSV and JSON attachments.");
   };
 
   const send = async (preset?: string) => {
     const text = (preset ?? input).trim();
     if (!text || busy || searching) return;
+    if (listeningRef.current) stopMic();
 
     const session = ensureSession();
     const sessionId = session.id;
-    const currentMessages = session.messages;
-    const user: Message = { id: id(), role: "user", content: text, fileName: fileName || undefined };
-    const nextMessages = [...currentMessages, user];
-    const title = session?.title === "New chat" ? text.replace(/\s+/g, " ").slice(0, 48) : session?.title;
+    const user: Message = { id: id(), role: "user", content: text, fileName: fileName && !fileAnnounced ? fileName : undefined };
+    const nextMessages = [...session.messages, user];
+    const title = session.title === "New chat" ? text.replace(/\s+/g, " ").slice(0, 48) : session.title;
     updateSession(sessionId, nextMessages, title, session);
     setInput("");
     setSources([]);
+    if (fileName) setFileAnnounced(true);
 
     if (isIdentityQuestion(text)) {
-      const reply = Jarvis_INTRO;
-      updateSession(sessionId, [...nextMessages, { id: id(), role: "assistant", content: reply }], title, session);
-      speak(reply);
-      setFileContext("");
-      setFileName("");
+      updateSession(sessionId, [...nextMessages, { id: id(), role: "assistant", content: Jarvis_INTRO }], title, session);
+      speak(Jarvis_INTRO);
       return;
     }
 
-    let found: Source[] = [];
     try {
-      const needsWeb = web && /\b(latest|today|tonight|yesterday|tomorrow|current|currently|recent|news|price|prices|weather|score|scores|stock|stocks|search the web|look up|who is|what happened|this week|this month|202[5-9]|203\d)\b/i.test(text);
-      if (needsWeb) {
+      let found: Source[] = [];
+      let searchFailed = false;
+      if (web && WEB_HINT.test(text)) {
         setSearching(true);
-        const r = await fetch("/api/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: text }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error);
-        found = d.results || [];
+        try {
+          const d = await api("/api/search", { query: text.slice(0, 300) });
+          found = cleanSources(d.results);
+        } catch (e) {
+          if ((e as ApiError).code === "ACCESS_REQUIRED") throw e;
+          searchFailed = true; // degrade gracefully: still answer, but say so
+        }
         setSources(found);
       }
       setSearching(false);
       setBusy(true);
-      const history = nextMessages.map(({ role, content }) => ({ role, content }));
-      const r = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, sources: found, mode, document: fileContext, documentName: fileName }),
-      });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error);
-      updateSession(sessionId, [...nextMessages, { id: id(), role: "assistant", content: d.message }], title, session);
-      speak(d.message);
-      setFileContext("");
-      setFileName("");
+      // Don't send local error notices back to the model as conversation history.
+      const history = nextMessages.filter((m) => !m.error).slice(-12).map(({ role, content }) => ({ role, content }));
+      const d = await api("/api/chat", { messages: history, sources: found, mode, document: fileContext, documentName: fileName });
+      const reply = String(d.message || "") + (searchFailed ? "\n\n_Live web search was unavailable, so this answer may be out of date._" : "");
+      updateSession(sessionId, [...nextMessages, { id: id(), role: "assistant", content: reply }], title, session);
+      speak(reply);
     } catch (e) {
       updateSession(sessionId, [
         ...nextMessages,
-        {
-          id: id(),
-          role: "assistant",
-          content: `I couldn't complete that request. ${e instanceof Error ? e.message : "Something went wrong."}`,
-        },
+        { id: id(), role: "assistant", error: true, content: `I couldn't complete that request. ${e instanceof Error ? e.message : "Something went wrong."}` },
       ], title, session);
     } finally {
       setSearching(false);
@@ -534,7 +662,7 @@ function ChatApp() {
           </button>
           <div className="top-title"><span className="top-status" /> Jarvis</div>
           <div className="top-actions">
-            <button className={`tool-chip ${web ? "on" : ""}`} onClick={() => setWeb((v) => !v)}><Globe2 size={15} /> Web <b>{web ? "ON" : "OFF"}</b></button>
+            <button className={`tool-chip ${web ? "on" : ""}`} onClick={() => setWeb((v) => !v)}><Globe2 size={15} /> Web <b>{web ? "AUTO" : "OFF"}</b></button>
             <select className="mode-select" value={mode} onChange={(e) => setMode(e.target.value as Mode)} aria-label="Mode">
               <option value="general">General</option>
               <option value="college">College / Project</option>
@@ -565,7 +693,15 @@ function ChatApp() {
                         {m.fileName && <div className="file-pill"><FileText size={12} /> {m.fileName}</div>}
                         <div className="message-text">
                           {m.role === "assistant" ? (
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              skipHtml
+                              components={{
+                                // Block images (data-exfiltration vector) and open links safely.
+                                img: () => null,
+                                a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+                              }}
+                            >{m.content}</ReactMarkdown>
                           ) : (
                             <span>{m.content}</span>
                           )}
@@ -589,20 +725,20 @@ function ChatApp() {
             <motion.div className="sources-panel" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
               <div className="sources-title"><Search size={14} /> Sources <span>{sources.length}</span></div>
               <div className="sources-list">
-                {sources.map((s, i) => <a className="source-card" href={s.url} target="_blank" rel="noreferrer" key={`${s.url}-${i}`}><span className="source-num">{i + 1}</span><div><b>{s.title}</b><small>{new URL(s.url).hostname}</small></div><Link2 size={14} /></a>)}
+                {sources.map((s, i) => <a className="source-card" href={s.url} target="_blank" rel="noreferrer" key={`${s.url}-${i}`}><span className="source-num">{i + 1}</span><div><b>{s.title}</b><small>{safeHost(s.url)}</small></div><Link2 size={14} /></a>)}
               </div>
             </motion.div>
           )}
 
           {showTools && (
             <div className="tools-panel">
-              <div><Globe2 size={16} /><span><b>Web search</b><small>Use Tavily for current information</small></span><button onClick={() => setWeb((v) => !v)}>{web ? "On" : "Off"}</button></div>
+              <div><Globe2 size={16} /><span><b>Web search</b><small>Searches automatically for current or time-sensitive questions</small></span><button onClick={() => setWeb((v) => !v)}>{web ? "On" : "Off"}</button></div>
               <div><Volume2 size={16} /><span><b>Voice responses</b><small>Read Jarvis answers aloud</small></span><button onClick={() => setSpeakOn((v) => !v)}>{speakOn ? "On" : "Off"}</button></div>
               <div><Code2 size={16} /><span><b>Mode</b><small>Change how Jarvis approaches your request</small></span><b className="tool-value">{mode}</b></div>
             </div>
           )}
 
-          {fileName && <div className="attachment-bar"><FileText size={15} /><span>{fileName} ready for Jarvis</span><button onClick={() => { setFileName(""); setFileContext(""); }}>Remove</button></div>}
+          {fileName && <div className="attachment-bar"><FileText size={15} /><span>{fileName} attached to this chat</span><button onClick={() => { setFileName(""); setFileContext(""); setFileAnnounced(false); }}>Remove</button></div>}
 
           <AnimatePresence>
             {listening && <ListeningIndicator speaking={voiceSpeaking} />}
@@ -610,7 +746,7 @@ function ChatApp() {
 
           <div className="composer-wrap">
             <div className="composer">
-              <input ref={fileRef} hidden type="file" accept="application/pdf,text/plain,text/markdown,text/csv,application/json" onChange={(e) => attach(e.target.files?.[0])} />
+              <input ref={fileRef} hidden type="file" accept="application/pdf,text/plain,text/markdown,text/csv,application/json" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; void attach(f); }} />
               <button className="composer-icon" onClick={() => fileRef.current?.click()} disabled={fileLoading} aria-label="Attach file"><Paperclip size={19} /></button>
               <textarea
                 ref={textareaRef}
